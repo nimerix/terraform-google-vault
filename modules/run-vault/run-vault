@@ -71,11 +71,71 @@ function log_error() {
 	log "ERROR" "$message"
 }
 
+function kms_decrypt() {
+	local readonly localfile="$1"
+	local readonly bucketfile="$2"
+	local readonly kms_keyring="$3"
+	local readonly kms_key="$4"
+	local readonly should_overwrite="$5"
+	# local suffix=".encrypted.base64"
+	if [[ -z "$localfile" ]]; then
+		log_error "The value for '$localfile' cannot be empty"
+		exit 1
+	fi
+	if ! mkdir -p $(dirname "$localfile") >/dev/null; then
+		log_error "The failed to create parent path of $localfile"
+		exit 1
+	fi
+	if ! gsutil stat "$bucketfile" --quiet; then
+		log_error "The bucket file for $localfile does not exist"
+		print_usage
+		exit 1
+	fi
+	if [[ -z "$bucketfile" ]]; then
+		log_error "The value for '$bucketfile' cannot be empty"
+		exit 1
+	fi
+	if [[ -z "$kms_keyring" ]]; then
+		log_error "The value for '$kms_keyring' cannot be empty"
+		exit 1
+	fi
+	if [[ -z "$kms_key" ]]; then
+		log_error "The value for '$kms_key' cannot be empty"
+		exit 1
+	fi
+
+	if [[ -f "$localfile" && -z "$should_overwrite" ]]; then
+		exit 0
+	else
+		if gcloud kms decrypt \
+			--location global \
+			--keyring=$kms_keyring \
+			--key=$kms_key \
+			--plaintext-file $localfile \
+			--ciphertext-file=<(gsutil cat $bucketfile | base64 -d); then
+			chmod 0600 $localfile
+			exit 0
+		else
+			log_error "failed to decrypt $localfile from $bucketfile"
+			exit 1
+
+		fi
+
+	fi
+
+}
+
 # Based on code from: http://stackoverflow.com/a/16623897/483528
 function strip_prefix() {
 	local readonly str="$1"
 	local readonly prefix="$2"
 	echo "${str#$prefix}"
+}
+
+function strip_suffix() {
+	local readonly str="$1"
+	local readonly suffix="$2"
+	echo "${str%$suffix}"
 }
 
 function assert_not_empty() {
@@ -201,6 +261,12 @@ function run() {
 	local gcp_creds_file=""
 	local port="$DEFAULT_PORT"
 	local cluster_port=""
+	local kms_gcp_creds_file=""
+	local kms_tls_key_file=""
+	local kms_tls_cert_file=""
+	local kms_unseal_keys_path=""
+	local kms_key=""
+	local kms_keyring=""
 	local config_dir=""
 	local bin_dir=""
 	local log_dir=""
@@ -209,10 +275,34 @@ function run() {
 	local skip_vault_config="false"
 	local all_args=()
 
-	while [[ $# > 0 ]]; do
+	while [[ $# -gt 0 ]]; do
 		local key="$1"
 
 		case "$key" in
+		--kms-unseal-keys-path)
+			kms_unseal_keys_path="$2"
+			shift
+			;;
+		--kms-tls-cert-file)
+			kms_tls_cert_file="$2"
+			shift
+			;;
+		--kms-tls-key-file)
+			kms_tls_key_file="$2"
+			shift
+			;;
+		--kms-key)
+			kms_key="$2"
+			shift
+			;;
+		--kms-keyring)
+			kms_keyring="$2"
+			shift
+			;;
+		--kms-gcp-creds-file)
+			kms_gcp_creds_file="$2"
+			shift
+			;;
 		--tls-cert-file)
 			tls_cert_file="$2"
 			shift
@@ -281,6 +371,11 @@ function run() {
 	assert_is_installed "supervisorctl"
 	assert_is_installed "curl"
 
+	if [[ -n "$kms_tls_key_file" ]] || [[ -n "$kms_tls_cert_file" ]] || [[ -n "$kms_gcp_creds_file" ]]; then
+		assert_not_empty "--kms-key" "$kms_key"
+		assert_not_empty "--kms-keyring" "$kms_keyring"
+	fi
+
 	if [[ -z "$config_dir" ]]; then
 		config_dir=$(cd "$SCRIPT_DIR/../config" && pwd)
 	fi
@@ -301,6 +396,18 @@ function run() {
 		cluster_port=$(($port + 1))
 	fi
 
+	if [[ -n "$kms_tls_key_file" ]]; then
+		kms_decrypt "$tls_key_file" "$kms_tls_key_file" "$kms_keyring" "$kms_key"
+	fi
+
+	if [[ -n "$kms_tls_cert_file" ]]; then
+		kms_decrypt "$tls_cert_file" "$kms_tls_cert_file" "$kms_keyring" "$kms_key"
+	fi
+
+	if [[ -n "$kms_gcp_creds_file" ]]; then
+		kms_decrypt "$gcp_creds_file" "$kms_gcp_creds_file" "$kms_keyring" "$kms_key"
+	fi
+
 	if [[ "$skip_vault_config" == "true" ]]; then
 		log_info "The --skip-vault-config flag is set, so will not generate a default Vault config file."
 	else
@@ -309,6 +416,31 @@ function run() {
 
 	generate_supervisor_config "$SUPERVISOR_CONFIG_PATH" "$config_dir" "$bin_dir" "$log_dir" "$log_level" "$user"
 	start_vault
+
+	if [[ -n "$kms_unseal_keys_path" ]]; then
+		(while [[ $count -lt 15 && "$(vault status 2>&1)" =~ "connection refused" ]]; do
+			((count = count + 1))
+			echo "$(date) $count: Waiting for Vault to start..."
+			sleep 2
+		done && [[ $count -lt 15 ]])
+		[[ $? -ne 0 ]] && echo "ERROR: Error waiting for Vault to start" && exit 1
+		if [[ $(vault status) =~ "Sealed: true" ]]; then
+			echo "Vault already initialized"
+		else
+			vault init >/tmp/vault_unseal_keys.txt
+
+			gcloud kms encrypt \
+				--location=global \
+				--keyring=$kms_keyring \
+				--key=$kms_key \
+				--plaintext-file=/tmp/vault_unseal_keys.txt \
+				--ciphertext-file=/tmp/vault_unseal_keys.txt.encrypted
+
+			gsutil cp /tmp/vault_unseal_keys.txt.encrypted $kms_unseal_keys_path
+			rm -f /tmp/vault_unseal_keys.txt*
+		fi
+	fi
+
 }
 
 run "$@"
